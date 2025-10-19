@@ -14,9 +14,11 @@ you need
 
 - libcurl
 - libcurl-devel
+- tar
+- unzip
 - libssl
 - the internet
 
 ``gcc -o tinygit tinygit.c -lcurl``
 
-
+- same for tcc  
