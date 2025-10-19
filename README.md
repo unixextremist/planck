@@ -1,7 +1,6 @@
 # tinygit
 
-- a minimal git implementation in c
-- all it does is clone repos
+- a minimal git clone implementation in c
 
 # use cases
 
@@ -15,7 +14,7 @@ you need
 - libcurl
 - libcurl-devel
 - tar
-- unzip
+- unzip (depends)
 - libssl
 - the internet
 
