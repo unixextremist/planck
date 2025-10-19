@@ -1,405 +1,305 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <sys/wait.h>
 #include <curl/curl.h>
-#include <stdarg.h>
+#include <sys/stat.h>
+#include <libgen.h>
+#include "config.h"
 
-#define MAX_PATH 4096
-#define BUFFER_SIZE 8192
+struct memory {
+    char *response;
+    size_t size;
+};
 
-typedef enum {
-    REPO_GITHUB,
-    REPO_GITLAB,
-    REPO_CODEBERG,
-    REPO_GENERIC
-} RepoType;
+static size_t write_callback(void *data, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    struct memory *mem = (struct memory *)userp;
+    
+    char *ptr = realloc(mem->response, mem->size + realsize + 1);
+    if(!ptr) return 0;
+    
+    mem->response = ptr;
+    memcpy(&(mem->response[mem->size]), data, realsize);
+    mem->size += realsize;
+    mem->response[mem->size] = 0;
+    
+    return realsize;
+}
 
-typedef struct {
-    char url[1024];
-    char path[MAX_PATH];
-    char branch[64];
-    int verbose;
-    int use_https;
-} CloneOptions;
-
-size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+static size_t write_file(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     return fwrite(ptr, size, nmemb, stream);
 }
 
-void log_message(int verbose, const char* format, ...) {
-    if (!verbose) return;
+char* extract_json_string(const char *json, const char *key) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    char *pos = strstr(json, pattern);
+    if (!pos) {
+        snprintf(pattern, sizeof(pattern), "\"%s\": \"", key);
+        pos = strstr(json, pattern);
+    }
+    if (!pos) return NULL;
     
-    va_list args;
-    va_start(args, format);
-    vfprintf(stderr, format, args);
-    va_end(args);
+    pos += strlen(pattern);
+    char *end = strchr(pos, '"');
+    if (!end) return NULL;
+    
+    size_t len = end - pos;
+    char *result = malloc(len + 1);
+    if (!result) return NULL;
+    
+    memcpy(result, pos, len);
+    result[len] = '\0';
+    return result;
 }
 
-int create_directory(const char* path) {
-    struct stat st = {0};
-    if (stat(path, &st) == -1) {
-        if (mkdir(path, 0755) == -1) {
-            perror("mkdir failed");
-            return -1;
-        }
-        return 0;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "Path exists but is not a directory: %s\n", path);
-        return -1;
-    }
-    return 0;
-}
-
-void get_repo_name(const char* url, char* name, size_t name_size) {
-    const char* last_slash = strrchr(url, '/');
-    const char* last_dot = strrchr(url, '.');
-    
-    if (!last_slash) {
-        strncpy(name, "repository", name_size);
-        name[name_size-1] = '\0';
-        return;
-    }
-    
-    const char* start = last_slash + 1;
-    const char* end = last_dot && last_dot > start ? last_dot : url + strlen(url);
-    
-    size_t len = end - start;
-    if (len >= name_size) len = name_size - 1;
-    
-    strncpy(name, start, len);
-    name[len] = '\0';
-    
-    size_t current_len = strlen(name);
-    if (current_len > 4 && strcmp(name + current_len - 4, ".git") == 0) {
-        name[current_len - 4] = '\0';
-    }
-}
-
-int http_download_safe(const char* url, const char* output_path, int verbose) {
+int download_file(const char *url, const char *output) {
     CURL *curl = curl_easy_init();
-    if(!curl) {
-        log_message(verbose, "Failed to initialize CURL\n");
-        return -1;
-    }
+    if (!curl) return -1;
     
-    FILE *fp = fopen(output_path, "wb");
-    if(!fp) {
-        log_message(verbose, "Failed to open output file: %s\n", output_path);
+    FILE *fp = fopen(output, "wb");
+    if (!fp) {
         curl_easy_cleanup(curl);
         return -1;
     }
     
     curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_file);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "simple-clone/1.0");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT_SECONDS);
     
-    log_message(verbose, "Downloading: %s\n", url);
     CURLcode res = curl_easy_perform(curl);
-    
     fclose(fp);
+    
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_easy_cleanup(curl);
     
-    if(res != CURLE_OK) {
-        log_message(verbose, "Download failed: %s\n", curl_easy_strerror(res));
-        return -1;
-    }
-    
-    return 0;
+    return (res == CURLE_OK && http_code == 200) ? 0 : -1;
 }
 
-RepoType detect_repo_type(const char* url) {
-    if (strstr(url, "github.com")) return REPO_GITHUB;
-    if (strstr(url, "gitlab.com")) return REPO_GITLAB;
-    if (strstr(url, "codeberg.org")) return REPO_CODEBERG;
-    return REPO_GENERIC;
+char* fetch_url(const char *url) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
+    
+    struct memory chunk = {0};
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT_SECONDS);
+    
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+    
+    if (res != CURLE_OK || http_code != 200) {
+        free(chunk.response);
+        return NULL;
+    }
+    
+    return chunk.response;
 }
 
-int extract_archive(const char* archive_path, const char* extract_path, int verbose) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        const char* args_tar[] = {"tar", "-xf", archive_path, "-C", extract_path, "--strip-components=1", NULL};
-        const char* args_unzip[] = {"unzip", "-q", archive_path, "-d", extract_path, NULL};
-        
-        execvp("tar", (char* const*)args_tar);
-        execvp("unzip", (char* const*)args_unzip);
-        
-        fprintf(stderr, "Failed to extract archive: need tar or unzip\n");
-        exit(1);
-    } else if (pid > 0) {
-        int status;
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status)) {
-            int exit_code = WEXITSTATUS(status);
-            if (exit_code == 0) {
-                log_message(verbose, "Successfully extracted archive\n");
-            } else {
-                log_message(verbose, "Archive extraction failed with code %d\n", exit_code);
-            }
-            return exit_code;
-        }
+int parse_repo_url(const char *url, char **service, char **owner, char **repo) {
+    char *copy = strdup(url);
+    if (!copy) return -1;
+    
+    char *protocol = strstr(copy, "://");
+    if (!protocol) {
+        free(copy);
         return -1;
     }
-    perror("fork failed");
-    return -1;
-}
-
-int git_init(const char* path, int verbose) {
-    char git_dir[MAX_PATH];
-    snprintf(git_dir, sizeof(git_dir), "%s/.git", path);
+    char *host_start = protocol + 3;
     
-    if (create_directory(git_dir) != 0) {
-        log_message(verbose, "Failed to create .git directory\n");
+    char *path_start = strchr(host_start, '/');
+    if (!path_start) {
+        free(copy);
         return -1;
     }
+    *path_start = '\0';
+    path_start++;
     
-    char subdir[MAX_PATH];
-    const char* subdirs[] = {"objects", "refs", "refs/heads", "refs/tags", "info", "hooks", NULL};
+    char *host = host_start;
     
-    for (int i = 0; subdirs[i]; i++) {
-        snprintf(subdir, sizeof(subdir), "%s/%s", git_dir, subdirs[i]);
-        if (create_directory(subdir) != 0) {
-            log_message(verbose, "Failed to create subdirectory: %s\n", subdir);
-            return -1;
-        }
-    }
-    
-    char head_file[MAX_PATH];
-    snprintf(head_file, sizeof(head_file), "%s/HEAD", git_dir);
-    FILE* fp = fopen(head_file, "w");
-    if (fp) {
-        fprintf(fp, "ref: refs/heads/main\n");
-        fclose(fp);
+    if (strcmp(host, "github.com") == 0) {
+        *service = strdup("github");
+    } else if (strcmp(host, "gitlab.com") == 0) {
+        *service = strdup("gitlab");
+    } else if (strcmp(host, "codeberg.org") == 0) {
+        *service = strdup("codeberg");
     } else {
-        log_message(verbose, "Failed to create HEAD file\n");
+        free(copy);
         return -1;
     }
     
-    char config_file[MAX_PATH];
-    snprintf(config_file, sizeof(config_file), "%s/config", git_dir);
-    fp = fopen(config_file, "w");
-    if (fp) {
-        fprintf(fp, "[core]\n");
-        fprintf(fp, "\trepositoryformatversion = 0\n");
-        fprintf(fp, "\tfilemode = true\n");
-        fprintf(fp, "\tbare = false\n");
-        fprintf(fp, "\tlogallrefupdates = true\n");
-        fclose(fp);
+    char *owner_start = path_start;
+    char *repo_start = strchr(owner_start, '/');
+    if (!repo_start) {
+        free(copy);
+        free(*service);
+        return -1;
+    }
+    *repo_start = '\0';
+    repo_start++;
+    
+    *owner = strdup(owner_start);
+    *repo = strdup(repo_start);
+    
+    char *git_suffix = strstr(*repo, ".git");
+    if (git_suffix) {
+        *git_suffix = '\0';
+    }
+    
+    free(copy);
+    return 0;
+}
+
+int download_release(const char *owner, const char *repo, const char *service) {
+    char api_url[512];
+    char download_url[512];
+    char output_file[256];
+    
+    if (strcmp(service, "github") == 0) {
+        snprintf(api_url, sizeof(api_url), "%s/%s/%s/releases/latest", GITHUB_API, owner, repo);
+    } else if (strcmp(service, "gitlab") == 0) {
+        char encoded_repo[512];
+        char temp[256];
+        snprintf(temp, sizeof(temp), "%s%%2F%s", owner, repo);
+        CURL *curl = curl_easy_init();
+        if (curl) {
+            char *output = curl_easy_escape(curl, temp, 0);
+            if (output) {
+                strncpy(encoded_repo, output, sizeof(encoded_repo));
+                curl_free(output);
+            }
+            curl_easy_cleanup(curl);
+        }
+        snprintf(api_url, sizeof(api_url), "%s/%s/releases/permalink/latest", GITLAB_API, encoded_repo);
+    } else if (strcmp(service, "codeberg") == 0) {
+        snprintf(api_url, sizeof(api_url), "%s/%s/%s/releases/latest", CODEBERG_API, owner, repo);
     } else {
-        log_message(verbose, "Failed to create config file\n");
+        fprintf(stderr, "unknown service: %s\n", service);
         return -1;
     }
     
-    log_message(verbose, "Initialized git repository\n");
-    return 0;
-}
-
-int detect_default_branch(const char* url, char* branch, size_t branch_size, int verbose) {
-    RepoType repo_type = detect_repo_type(url);
-    
-    if (repo_type == REPO_GITHUB) {
-        char api_url[2048];
-        const char* github_prefix = "https://github.com/";
-        if (strstr(url, github_prefix)) {
-            const char* repo_path = url + strlen(github_prefix);
-            char owner[256], repo[256];
-            if (sscanf(repo_path, "%255[^/]/%255[^.]", owner, repo) == 2) {
-                snprintf(api_url, sizeof(api_url), 
-                        "https://api.github.com/repos/%s/%s", owner, repo);
-                
-                char temp_file[MAX_PATH];
-                snprintf(temp_file, sizeof(temp_file), "/tmp/clone_temp_%d.json", getpid());
-                
-                if (http_download_safe(api_url, temp_file, verbose) == 0) {
-                    FILE* fp = fopen(temp_file, "r");
-                    if (fp) {
-                        char line[256];
-                        while (fgets(line, sizeof(line), fp)) {
-                            if (strstr(line, "\"default_branch\"")) {
-                                char* start = strchr(line, ':');
-                                if (start) {
-                                    start++;
-                                    while (*start == ' ' || *start == '"') start++;
-                                    char* end = strchr(start, '"');
-                                    if (end) {
-                                        size_t len = end - start;
-                                        if (len < branch_size) {
-                                            strncpy(branch, start, len);
-                                            branch[len] = '\0';
-                                            fclose(fp);
-                                            unlink(temp_file);
-                                            log_message(verbose, "Detected default branch: %s\n", branch);
-                                            return 0;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        fclose(fp);
-                    }
-                    unlink(temp_file);
-                }
+    printf("checking releases at: %s\n", api_url);
+    char *response = fetch_url(api_url);
+    if (!response) {
+        printf("no releases found, falling back to branch download\n");
+        
+        if (strcmp(service, "github") == 0) {
+            snprintf(download_url, sizeof(download_url), "%s/%s/%s/archive/refs/heads/" DEFAULT_BRANCH "." FALLBACK_FORMAT, GITHUB_URL, owner, repo);
+        } else if (strcmp(service, "gitlab") == 0) {
+            snprintf(download_url, sizeof(download_url), "%s/%s/%s/-/archive/" DEFAULT_BRANCH "/%s-" DEFAULT_BRANCH "." FALLBACK_FORMAT, GITLAB_URL, owner, repo, repo);
+        } else if (strcmp(service, "codeberg") == 0) {
+#if CODEBERG_PREFER_TAR_GZ
+            const char *format = "tar.gz";
+#else
+            const char *format = FALLBACK_FORMAT;
+#endif
+            snprintf(download_url, sizeof(download_url), "%s/%s/%s/archive/" DEFAULT_BRANCH ".%s", CODEBERG_URL, owner, repo, format);
+        }
+        
+        snprintf(output_file, sizeof(output_file), "%s-%s-%s.%s", owner, repo, DEFAULT_BRANCH, FALLBACK_FORMAT);
+    } else {
+        char *tag_name = extract_json_string(response, "tag_name");
+        if (!tag_name) {
+            printf("no releases found, falling back to branch download\n");
+            free(response);
+            
+            if (strcmp(service, "github") == 0) {
+                snprintf(download_url, sizeof(download_url), "%s/%s/%s/archive/refs/heads/" DEFAULT_BRANCH "." FALLBACK_FORMAT, GITHUB_URL, owner, repo);
+            } else if (strcmp(service, "gitlab") == 0) {
+                snprintf(download_url, sizeof(download_url), "%s/%s/%s/-/archive/" DEFAULT_BRANCH "/%s-" DEFAULT_BRANCH "." FALLBACK_FORMAT, GITLAB_URL, owner, repo, repo);
+            } else if (strcmp(service, "codeberg") == 0) {
+#if CODEBERG_PREFER_TAR_GZ
+                const char *format = "tar.gz";
+#else
+                const char *format = FALLBACK_FORMAT;
+#endif
+                snprintf(download_url, sizeof(download_url), "%s/%s/%s/archive/" DEFAULT_BRANCH ".%s", CODEBERG_URL, owner, repo, format);
             }
-        }
-    }
-    
-    strncpy(branch, "main", branch_size);
-    log_message(verbose, "Using default branch: %s\n", branch);
-    return 0;
-}
-
-int clone_via_archive(const CloneOptions* opts) {
-    if (create_directory(opts->path) != 0) {
-        return -1;
-    }
-    
-    if (git_init(opts->path, opts->verbose) != 0) {
-        return -1;
-    }
-    
-    char repo_name[256];
-    get_repo_name(opts->url, repo_name, sizeof(repo_name));
-    
-    char branch[64];
-    strncpy(branch, opts->branch, sizeof(branch));
-    if (strlen(branch) == 0) {
-        detect_default_branch(opts->url, branch, sizeof(branch), opts->verbose);
-    }
-    
-    char archive_url[2048];
-    RepoType repo_type = detect_repo_type(opts->url);
-    
-    switch (repo_type) {
-        case REPO_CODEBERG: {
-            const char* codeberg_prefix = "https://codeberg.org/";
-            const char* repo_path = opts->url + strlen(codeberg_prefix);
-            snprintf(archive_url, sizeof(archive_url), 
-                    "https://codeberg.org/%s/archive/%s.tar.gz", 
-                    repo_path, branch);
-            break;
-        }
-        case REPO_GITHUB: {
-            const char* github_prefix = "https://github.com/";
-            const char* repo_path = opts->url + strlen(github_prefix);
-            snprintf(archive_url, sizeof(archive_url), 
-                    "https://github.com/%s/archive/refs/heads/%s.tar.gz", 
-                    repo_path, branch);
-            break;
-        }
-        case REPO_GITLAB: {
-            const char* gitlab_prefix = "https://gitlab.com/";
-            const char* repo_path = opts->url + strlen(gitlab_prefix);
-            snprintf(archive_url, sizeof(archive_url), 
-                    "https://gitlab.com/%s/-/archive/%s/%s-%s.tar.gz", 
-                    repo_path, branch, repo_name, branch);
-            break;
-        }
-        default: {
-            snprintf(archive_url, sizeof(archive_url), "%s/archive/%s.tar.gz", opts->url, branch);
-            break;
-        }
-    }
-    
-    char temp_archive[MAX_PATH];
-    snprintf(temp_archive, sizeof(temp_archive), "/tmp/clone_archive_%d.tar.gz", getpid());
-    
-    if (http_download_safe(archive_url, temp_archive, opts->verbose) != 0) {
-        if (strcmp(branch, "main") == 0) {
-            strcpy(branch, "master");
-            switch (repo_type) {
-                case REPO_GITHUB:
-                    snprintf(archive_url, sizeof(archive_url), 
-                            "https://github.com/%s/archive/refs/heads/%s.tar.gz", 
-                            opts->url + strlen("https://github.com/"), branch);
-                    break;
-                default:
-                    snprintf(archive_url, sizeof(archive_url), "%s/archive/%s.tar.gz", opts->url, branch);
-                    break;
-            }
-            if (http_download_safe(archive_url, temp_archive, opts->verbose) != 0) {
-                log_message(opts->verbose, "Failed to download archive from fallback branch\n");
-                unlink(temp_archive);
-                return -1;
-            }
+            
+            snprintf(output_file, sizeof(output_file), "%s-%s-%s.%s", owner, repo, DEFAULT_BRANCH, FALLBACK_FORMAT);
         } else {
-            unlink(temp_archive);
-            return -1;
+            printf("found release: %s\n", tag_name);
+            
+            if (strcmp(service, "github") == 0) {
+                snprintf(download_url, sizeof(download_url), "%s/%s/%s/archive/refs/tags/%s." FALLBACK_FORMAT, GITHUB_URL, owner, repo, tag_name);
+            } else if (strcmp(service, "gitlab") == 0) {
+                snprintf(download_url, sizeof(download_url), "%s/%s/%s/-/archive/%s/%s-%s." FALLBACK_FORMAT, GITLAB_URL, owner, repo, tag_name, repo, tag_name);
+            } else if (strcmp(service, "codeberg") == 0) {
+#if CODEBERG_PREFER_TAR_GZ
+                const char *format = "tar.gz";
+#else
+                const char *format = FALLBACK_FORMAT;
+#endif
+                snprintf(download_url, sizeof(download_url), "%s/%s/%s/archive/%s.%s", CODEBERG_URL, owner, repo, tag_name, format);
+            }
+            
+            snprintf(output_file, sizeof(output_file), "%s-%s-%s.%s", owner, repo, tag_name, FALLBACK_FORMAT);
+            free(tag_name);
         }
+        free(response);
     }
     
-    if (extract_archive(temp_archive, opts->path, opts->verbose) != 0) {
-        log_message(opts->verbose, "Failed to extract archive\n");
-        unlink(temp_archive);
-        return -1;
+    printf("downloading: %s\n", download_url);
+    printf("saving as: %s\n", output_file);
+    
+    int result = download_file(download_url, output_file);
+    if (result == 0) {
+        printf("download successful: %s\n", output_file);
+    } else {
+        fprintf(stderr, "download failed\n");
     }
     
-    unlink(temp_archive);
-    return 0;
+    return result;
 }
 
-int parse_clone_options(int argc, char *argv[], CloneOptions *opts) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s [URL] [DESTINATION] [-b BRANCH] [-v]\n", argv[0]);
-        return -1;
-    }
-    
-    memset(opts, 0, sizeof(CloneOptions));
-    strcpy(opts->branch, "main");
-    
-    int url_found = 0;
-    int path_found = 0;
-    
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-v") == 0) {
-            opts->verbose = 1;
-        } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
-            strncpy(opts->branch, argv[++i], sizeof(opts->branch) - 1);
-        } else if (!url_found) {
-            strncpy(opts->url, argv[i], sizeof(opts->url) - 1);
-            url_found = 1;
-        } else if (!path_found) {
-            strncpy(opts->path, argv[i], sizeof(opts->path) - 1);
-            path_found = 1;
-        }
-    }
-    
-    if (!url_found) {
-        fprintf(stderr, "Error: URL is required\n");
-        return -1;
-    }
-    
-    if (!path_found) {
-        char repo_name[256];
-        get_repo_name(opts->url, repo_name, sizeof(repo_name));
-        strncpy(opts->path, repo_name, sizeof(opts->path) - 1);
-    }
-    
-    return 0;
+void print_usage(const char *program_name) {
+    printf("usage: %s <repository-url>\n", program_name);
+    printf("supported services: github, gitlab, codeberg\n");
+    printf("examples:\n");
+    printf("  %s https://github.com/unixextremist/coreutils\n", program_name);
+    printf("  %s https://gitlab.com/username/project\n", program_name);
+    printf("  %s https://codeberg.org/owner/repo.git\n", program_name);
 }
 
 int main(int argc, char *argv[]) {
-    CloneOptions opts = {0};
-    
-    if (parse_clone_options(argc, argv, &opts) != 0) {
+    if (argc != 2) {
+        print_usage(argv[0]);
         return 1;
     }
     
-    log_message(opts.verbose, "Cloning into '%s'...\n", opts.path);
+    const char *url = argv[1];
+    char *service = NULL;
+    char *owner = NULL;
+    char *repo = NULL;
+    
+    if (parse_repo_url(url, &service, &owner, &repo) != 0) {
+        fprintf(stderr, "error: invalid repository url\n");
+        fprintf(stderr, "supported formats:\n");
+        fprintf(stderr, "  https://github.com/owner/repo\n");
+        fprintf(stderr, "  https://gitlab.com/owner/repo\n");
+        fprintf(stderr, "  https://codeberg.org/owner/repo\n");
+        return 1;
+    }
+    
+    printf("service: %s, owner: %s, repo: %s\n", service, owner, repo);
     
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    
-    if (clone_via_archive(&opts) != 0) {
-        fprintf(stderr, "Clone failed\n");
-        curl_global_cleanup();
-        return 1;
-    }
-    
+    int result = download_release(owner, repo, service);
     curl_global_cleanup();
-    log_message(opts.verbose, "Clone completed successfully\n");
-    return 0;
+    
+    free(service);
+    free(owner);
+    free(repo);
+    
+    return result;
 }
