@@ -1,4 +1,4 @@
-# tinygit
+# planck
 
 - a minimal git clone implementation in c
 
@@ -18,6 +18,6 @@ you need
 - libssl
 - the internet
 
-``gcc -o tinygit tinygit.c -lcurl``
+``gcc -o planck planck.c -lcurl``
 
 - same for tcc  
