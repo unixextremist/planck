@@ -148,7 +148,7 @@ int download_release(const char *owner, const char *repo, const char *service) {
         printf("no releases found, falling back to branch download\n");
         const char *branch = "main";
         if (strcmp(service, "github") == 0) {
-            snprintf(download_url, sizeof(download_url), "%s/%s/%s/archive/refs/heads/%s.tar.gz", web_base, owner, repo, branch);
+            snprintf(download_url, sizeof(download_url), "%s/%s/%s/archive/refs/heads/%s.zip", web_base, owner, repo, branch);
         } else if (strcmp(service, "gitlab") == 0) {
             snprintf(download_url, sizeof(download_url), "%s/%s/%s/-/archive/%s/%s-%s.tar.gz", web_base, owner, repo, branch, repo, branch);
         } else {
